@@ -963,6 +963,23 @@ export class ApiHandler {
     </div>
   </div>
 
+  <!-- Inbox List Modal (Mobile) -->
+  <div x-show="showInboxList && isMobile" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" @click.self="showInboxList = false">
+    <div class="bg-white dark:bg-gray-800 rounded-xl p-6 w-full max-w-sm mx-4 shadow-2xl max-h-[70vh] flex flex-col">
+      <h3 class="text-lg font-bold text-gray-900 dark:text-white mb-4">切换邮箱</h3>
+      <div class="flex-1 overflow-y-auto divide-y divide-gray-100 dark:divide-gray-700">
+        <template x-for="inbox in inboxes" :key="inbox.address">
+          <div @click="switchInbox(inbox); showInboxList = false" class="py-3 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 px-2 rounded"
+               :class="inbox.address === address ? 'bg-brand-50 dark:bg-brand-900/20' : ''">
+            <div class="text-sm font-mono truncate" x-text="inbox.address"></div>
+            <div class="text-xs text-gray-400 mt-1" x-text="getInboxTimeLeft(inbox)"></div>
+          </div>
+        </template>
+      </div>
+      <button @click="showInboxList = false" class="mt-4 w-full px-4 py-2 text-sm font-medium text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600">关闭</button>
+    </div>
+  </div>
+
   <!-- Stats Modal -->
   <div x-show="showStatsModal" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" @click.self="showStatsModal = false">
     <div class="bg-white dark:bg-gray-800 rounded-xl p-6 w-full max-w-lg mx-4 shadow-2xl max-h-[80vh] overflow-y-auto">
