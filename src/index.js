@@ -9,7 +9,8 @@ export default {
 
   // 处理邮件接收
   async email(message, env, ctx) {
-    return new EmailHandler(env).handle(message);
+    const handler = new EmailHandler(env);
+    ctx.waitUntil(handler.handle(message));
   },
 
   // 处理定时任务 (Cron Triggers)
