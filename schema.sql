@@ -25,6 +25,13 @@ CREATE TABLE IF NOT EXISTS stats (
     received_at INTEGER NOT NULL
 );
 
+-- API Token 表
+CREATE TABLE IF NOT EXISTS api_tokens (
+    token TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_emails_inbox ON emails(inbox_address);
 CREATE INDEX IF NOT EXISTS idx_inboxes_expires ON inboxes(expires_at);
 CREATE INDEX IF NOT EXISTS idx_stats_received ON stats(received_at);

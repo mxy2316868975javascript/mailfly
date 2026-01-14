@@ -11,7 +11,8 @@
   ],
   "vars": {
     "DOMAINS": "example.com,mail.example.org",
-    "MAIL_TTL": "3600"
+    "MAIL_TTL": "3600",
+    "ADMIN_TOKEN": "your-admin-token-here"
   },
   "triggers": {
     "crons": ["0 0 * * *"]

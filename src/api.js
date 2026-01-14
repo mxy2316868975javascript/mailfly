@@ -3,6 +3,7 @@ export class ApiHandler {
     this.db = env.DB;
     this.domains = (env.DOMAINS || env.DOMAIN || '').split(',').map(d => d.trim()).filter(Boolean);
     this.ttl = parseInt(env.MAIL_TTL) * 1000;
+    this.adminToken = env.ADMIN_TOKEN || null;
   }
 
   async handle(request) {
@@ -20,50 +21,72 @@ export class ApiHandler {
         return this.html();
       }
 
+      // Token 管理 API（需要 Admin Token）
+      if (path === '/api/tokens' && method === 'GET') {
+        if (!this.checkAdmin(request)) return this.cors(this.json({ error: 'Unauthorized' }, 401));
+        return this.cors(await this.listTokens());
+      }
+      if (path === '/api/tokens' && method === 'POST') {
+        if (!this.checkAdmin(request)) return this.cors(this.json({ error: 'Unauthorized' }, 401));
+        const body = await request.json().catch(() => ({}));
+        return this.cors(await this.createToken(body.name));
+      }
+      if (path.startsWith('/api/tokens/') && method === 'DELETE') {
+        if (!this.checkAdmin(request)) return this.cors(this.json({ error: 'Unauthorized' }, 401));
+        const token = path.split('/')[3];
+        return this.cors(await this.deleteToken(token));
+      }
+
+      // 需要 Token 认证的 API
+      if (path.startsWith('/api/')) {
+        const authOk = await this.checkAuth(request);
+        if (!authOk) return this.cors(this.json({ error: 'Invalid or missing API token' }, 401));
+      }
+
       if (path === '/api/inbox' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
         return this.cors(await this.createInbox(body.prefix, body.domain));
       }
-      
+
       if (path === '/api/domains' && method === 'GET') {
         return this.cors(this.json({ domains: this.domains }));
       }
-      
+
       if (path === '/api/stats' && method === 'GET') {
         return this.cors(await this.getStats());
       }
-      
+
       if (path.startsWith('/api/inbox/') && path.endsWith('/stats') && method === 'GET') {
         const address = decodeURIComponent(path.split('/')[3]);
         return this.cors(await this.getInboxStats(address));
       }
-      
+
       if (path.startsWith('/api/inbox/') && path.endsWith('/renew') && method === 'POST') {
         const address = decodeURIComponent(path.split('/')[3]);
         return this.cors(await this.renewInbox(address));
       }
-      
+
       if (path.startsWith('/api/inbox/') && path.endsWith('/forward') && method === 'POST') {
         const address = decodeURIComponent(path.split('/')[3]);
         const body = await request.json().catch(() => ({}));
         return this.cors(await this.setForward(address, body.forward_to));
       }
-      
+
       if (path.startsWith('/api/inbox/') && method === 'GET') {
         const address = decodeURIComponent(path.split('/')[3]);
         return this.cors(await this.getEmails(address));
       }
-      
+
       if (path.startsWith('/api/inbox/') && method === 'DELETE') {
         const address = decodeURIComponent(path.split('/')[3]);
         return this.cors(await this.deleteInbox(address));
       }
-      
+
       if (path.startsWith('/api/mail/') && method === 'DELETE') {
         const id = path.split('/')[3];
         return this.cors(await this.deleteEmail(id));
       }
-      
+
       if (path.startsWith('/api/mail/') && method === 'GET') {
         const id = path.split('/')[3];
         if (url.searchParams.get('format') === 'raw') {
@@ -78,7 +101,38 @@ export class ApiHandler {
       return this.cors(this.json({ error: e.message }, 500));
     }
   }
-  
+
+  checkAdmin(request) {
+    if (!this.adminToken) return true;
+    const auth = request.headers.get('Authorization');
+    return auth === `Bearer ${this.adminToken}`;
+  }
+
+  async checkAuth(request) {
+    const auth = request.headers.get('Authorization');
+    if (!auth?.startsWith('Bearer ')) return false;
+    const token = auth.slice(7);
+    if (this.adminToken && token === this.adminToken) return true;
+    const row = await this.db.prepare('SELECT 1 FROM api_tokens WHERE token = ?').bind(token).first();
+    return !!row;
+  }
+
+  async listTokens() {
+    const tokens = await this.db.prepare('SELECT token, name, created_at FROM api_tokens ORDER BY created_at DESC').all();
+    return this.json({ tokens: tokens.results || [] });
+  }
+
+  async createToken(name) {
+    const token = 'mf_' + crypto.randomUUID().replace(/-/g, '');
+    await this.db.prepare('INSERT INTO api_tokens (token, name, created_at) VALUES (?, ?, ?)').bind(token, name || 'Unnamed', Date.now()).run();
+    return this.json({ token, name: name || 'Unnamed' });
+  }
+
+  async deleteToken(token) {
+    await this.db.prepare('DELETE FROM api_tokens WHERE token = ?').bind(token).run();
+    return this.json({ success: true });
+  }
+
   async scheduled(event) {
     await this.cleanup();
   }

@@ -115,6 +115,26 @@ wrangler deploy
 
 ## 📡 API 接口
 
+### 认证
+
+所有 `/api/*` 接口需要 Bearer Token 认证：
+
+```bash
+curl -H "Authorization: Bearer your-api-token" https://your-worker.dev/api/inbox
+```
+
+Token 类型：
+- **Admin Token**: 在 `wrangler.jsonc` 中配置的 `ADMIN_TOKEN`，拥有所有权限
+- **API Token**: 通过 API 创建的普通 Token，可访问邮箱相关接口
+
+### Token 管理（需要 Admin Token）
+
+| 方法 | 端点 | 描述 |
+|------|------|------|
+| `GET` | `/api/tokens` | 获取所有 API Token |
+| `POST` | `/api/tokens` | 创建新 Token |
+| `DELETE` | `/api/tokens/:token` | 删除 Token |
+
 ### 基础接口
 
 | 方法 | 端点 | 描述 |
@@ -198,7 +218,8 @@ curl https://your-worker.dev/api/stats
   ],
   "vars": {
     "DOMAINS": "example.com,mail.example.org",  // 逗号分隔的域名列表
-    "MAIL_TTL": "3600"                          // 邮箱有效期（秒）
+    "MAIL_TTL": "3600",                          // 邮箱有效期（秒）
+    "ADMIN_TOKEN": "your-secret-admin-token"     // 管理员 Token（用于管理 API Token）
   },
   "triggers": {
     "crons": ["0 0 * * *"]                      // 每日清理计划
