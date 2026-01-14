@@ -44,6 +44,9 @@
 - 🗑️ **邮件删除** - 单独删除某封邮件（不影响统计）
 - 📊 **统计面板** - 顶部实时统计栏 + 详细统计弹窗
 - 🔑 **验证码提取** - 自动识别邮件中的验证码，一键复制
+- 🔐 **混合账户系统** - 支持匿名模式和账户模式
+- 🔑 **密钥管理** - 查看和导出邮箱访问密钥
+- 📱 **移动端优化** - 完整功能支持，响应式设计
 
 ### 统计功能
 - 📈 **顶部统计栏** - 实时显示今日收件、总收件、活跃邮箱
@@ -115,17 +118,42 @@ wrangler deploy
 
 ## 📡 API 接口
 
-### 认证
+### 账户系统
 
-所有 `/api/*` 接口需要 Bearer Token 认证：
+Mailfly 支持两种使用模式：
 
+#### 匿名模式（默认）
+- 创建邮箱时自动生成访问密钥（`access_key`）
+- 密钥存储在浏览器本地
+- 所有邮箱操作需提供密钥参数 `?key=xxx`
+- 适合临时使用，无需注册
+
+#### 账户模式（可选）
+- 注册账户后获得 JWT Token（30天有效期）
+- 使用 `Authorization: Bearer <token>` 认证
+- 创建的邮箱自动关联账户
+- 可跨设备访问自己的邮箱
+
+### 账户接口
+
+| 方法 | 端点 | 描述 |
+|------|------|------|
+| `POST` | `/api/auth/register` | 注册账户（用户名≥3字符，密码≥6字符） |
+| `POST` | `/api/auth/login` | 登录获取 JWT Token |
+
+**注册示例：**
 ```bash
-curl -H "Authorization: Bearer your-api-token" https://your-worker.dev/api/inbox
+curl -X POST https://your-worker.dev/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username": "user123", "password": "password123"}'
 ```
 
-Token 类型：
-- **Admin Token**: 在 `wrangler.jsonc` 中配置的 `ADMIN_TOKEN`，拥有所有权限
-- **API Token**: 通过 API 创建的普通 Token，可访问邮箱相关接口
+**登录示例：**
+```bash
+curl -X POST https://your-worker.dev/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "user123", "password": "password123"}'
+```
 
 ### Token 管理（需要 Admin Token）
 
@@ -134,6 +162,8 @@ Token 类型：
 | `GET` | `/api/tokens` | 获取所有 API Token |
 | `POST` | `/api/tokens` | 创建新 Token |
 | `DELETE` | `/api/tokens/:token` | 删除 Token |
+
+Admin Token 在 `wrangler.jsonc` 中配置的 `ADMIN_TOKEN`。
 
 ### 基础接口
 
@@ -145,22 +175,24 @@ Token 类型：
 
 ### 邮箱管理
 
+所有邮箱操作需要提供访问密钥或 JWT Token：
+
 | 方法 | 端点 | 描述 |
 |------|------|------|
-| `POST` | `/api/inbox` | 创建新邮箱 |
-| `GET` | `/api/inbox/:address` | 获取邮箱邮件列表 |
-| `DELETE` | `/api/inbox/:address` | 删除邮箱 |
-| `POST` | `/api/inbox/:address/renew` | 续期邮箱 |
-| `POST` | `/api/inbox/:address/forward` | 设置转发地址 |
-| `GET` | `/api/inbox/:address/stats` | 获取邮箱统计 |
+| `POST` | `/api/inbox` | 创建新邮箱（返回 access_key） |
+| `GET` | `/api/inbox/:address?key=xxx` | 获取邮箱邮件列表 |
+| `DELETE` | `/api/inbox/:address` | 删除邮箱（需在 body 中提供 key） |
+| `POST` | `/api/inbox/:address/renew` | 续期邮箱（需在 body 中提供 key） |
+| `POST` | `/api/inbox/:address/forward` | 设置转发地址（需在 body 中提供 key） |
+| `GET` | `/api/inbox/:address/stats?key=xxx` | 获取邮箱统计 |
 
 ### 邮件操作
 
 | 方法 | 端点 | 描述 |
 |------|------|------|
-| `GET` | `/api/mail/:id` | 获取邮件内容（含自动提取的验证码） |
-| `GET` | `/api/mail/:id?format=raw` | 下载原始 .eml 文件 |
-| `DELETE` | `/api/mail/:id` | 删除邮件 |
+| `GET` | `/api/mail/:id?key=xxx` | 获取邮件内容（含自动提取的验证码） |
+| `GET` | `/api/mail/:id?format=raw&key=xxx` | 下载原始 .eml 文件 |
+| `DELETE` | `/api/mail/:id` | 删除邮件（需在 body 中提供 key） |
 
 ### 验证码提取
 
@@ -183,23 +215,38 @@ Token 类型：
 
 ### 示例
 
-**创建邮箱：**
+**创建邮箱（匿名模式）：**
 ```bash
 curl -X POST https://your-worker.dev/api/inbox \
   -H "Content-Type: application/json" \
   -d '{"prefix": "test", "domain": "example.com"}'
+# 返回: {"address": "test@example.com", "expires_at": 1234567890, "access_key": "key_xxx"}
+```
+
+**获取邮箱邮件（使用密钥）：**
+```bash
+curl "https://your-worker.dev/api/inbox/test@example.com?key=key_xxx"
 ```
 
 **设置转发：**
 ```bash
 curl -X POST https://your-worker.dev/api/inbox/test@example.com/forward \
   -H "Content-Type: application/json" \
-  -d '{"forward_to": "your@email.com"}'
+  -d '{"forward_to": "your@email.com", "key": "key_xxx"}'
 ```
 
-**获取统计：**
+**使用 JWT Token（账户模式）：**
 ```bash
-curl https://your-worker.dev/api/stats
+# 登录获取 token
+TOKEN=$(curl -X POST https://your-worker.dev/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "user123", "password": "password123"}' | jq -r .token)
+
+# 使用 token 创建邮箱
+curl -X POST https://your-worker.dev/api/inbox \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prefix": "test"}'
 ```
 
 ## ⚙️ 配置说明
@@ -248,7 +295,9 @@ CREATE TABLE inboxes (
     address TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
-    forward_to TEXT              -- 转发目标邮箱
+    forward_to TEXT,
+    access_key TEXT NOT NULL,
+    user_id TEXT
 );
 
 -- 邮件表
@@ -267,6 +316,21 @@ CREATE TABLE stats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     from_addr TEXT NOT NULL,
     received_at INTEGER NOT NULL
+);
+
+-- 用户表
+CREATE TABLE users (
+    id TEXT PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+-- API Token 表
+CREATE TABLE api_tokens (
+    token TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 );
 ```
 
