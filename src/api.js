@@ -119,6 +119,23 @@ export class ApiHandler {
     return this.json({ address, expires_at: inbox.expires_at, forward_to: inbox.forward_to || null, emails: emails.results });
   }
 
+  extractCode(text) {
+    if (!text) return null;
+    const plain = text.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ');
+    // 6位数字验证码
+    let m = plain.match(/(?:验证码|code|码|Code|CODE)[^\d]*(\d{6})\b/i);
+    if (m) return m[1];
+    m = plain.match(/\b(\d{6})\b[^\d]*(?:验证码|code|码)/i);
+    if (m) return m[1];
+    // 4-8位纯数字
+    m = plain.match(/(?:验证码|code|码|Code|CODE)[^\d]*(\d{4,8})\b/i);
+    if (m) return m[1];
+    // 字母数字混合验证码
+    m = plain.match(/(?:验证码|code|码|Code|CODE)[^a-zA-Z0-9]*([A-Za-z0-9]{4,8})\b/i);
+    if (m) return m[1];
+    return null;
+  }
+
   async getEmail(id) {
     const email = await this.db.prepare(
       'SELECT id, inbox_address, from_addr, subject, body, received_at FROM emails WHERE id = ?'
@@ -127,6 +144,7 @@ export class ApiHandler {
     if (!email) {
       return this.json({ error: 'Email not found' }, 404);
     }
+    email.code = this.extractCode(email.subject + ' ' + email.body);
     return this.json(email);
   }
   
@@ -621,7 +639,17 @@ export class ApiHandler {
                  </div>
                  
                  <div class="flex justify-between items-start gap-4">
-                    <h1 class="text-lg md:text-xl font-bold text-gray-900 dark:text-white leading-tight" x-text="selectedEmail.subject"></h1>
+                    <div class="flex-1">
+                      <h1 class="text-lg md:text-xl font-bold text-gray-900 dark:text-white leading-tight" x-text="selectedEmail.subject"></h1>
+                      <div x-show="emailCode" class="mt-2 inline-flex items-center gap-2 bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-800 rounded-lg px-3 py-1.5">
+                        <i class="ph ph-key text-green-600"></i>
+                        <span class="text-sm text-green-700 dark:text-green-400">验证码:</span>
+                        <span class="font-mono font-bold text-green-700 dark:text-green-300 text-lg" x-text="emailCode"></span>
+                        <button @click="copyCode()" class="ml-1 p-1 hover:bg-green-100 dark:hover:bg-green-800/50 rounded" title="复制验证码">
+                          <i class="ph ph-copy text-green-600"></i>
+                        </button>
+                      </div>
+                    </div>
                     <div class="flex gap-2">
                        <a :href="'/api/mail/' + selectedEmail.id + '?format=raw'" target="_blank" class="p-2 text-gray-400 hover:text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-900/20 rounded-lg transition-colors" title="下载 .eml">
                           <i class="ph ph-download-simple text-lg"></i>
@@ -766,6 +794,7 @@ export class ApiHandler {
         animatedStats: { today: 0, total: 0, active: 0 },
         emails: [],
         selectedEmail: null,
+        emailCode: null,
         loading: false,
         loadingBody: false,
         timeLeft: 0,
@@ -906,16 +935,24 @@ export class ApiHandler {
 
         async selectEmail(email) {
             this.selectedEmail = email;
+            this.emailCode = null;
             this.loadingBody = true;
-            
+
             try {
                 const res = await fetch('/api/mail/' + email.id);
                 const data = await res.json();
+                this.emailCode = data.code || null;
                 this.renderEmailBody(data.body);
             } catch(e) {
                 this.showToast('加载邮件失败', 'error');
             }
             this.loadingBody = false;
+        },
+
+        copyCode() {
+            if (!this.emailCode) return;
+            navigator.clipboard.writeText(this.emailCode);
+            this.showToast('验证码已复制');
         },
 
         renderEmailBody(content) {
