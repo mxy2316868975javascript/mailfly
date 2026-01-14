@@ -1,0 +1,1167 @@
+export class ApiHandler {
+  constructor(env) {
+    this.db = env.DB;
+    this.domains = (env.DOMAINS || env.DOMAIN || '').split(',').map(d => d.trim()).filter(Boolean);
+    this.ttl = parseInt(env.MAIL_TTL) * 1000;
+  }
+
+  async handle(request) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    // CORS
+    if (method === 'OPTIONS') {
+      return this.cors(new Response(null, { status: 204 }));
+    }
+
+    try {
+      if (path === '/' && method === 'GET') {
+        return this.html();
+      }
+
+      if (path === '/api/inbox' && method === 'POST') {
+        const body = await request.json().catch(() => ({}));
+        return this.cors(await this.createInbox(body.prefix, body.domain));
+      }
+      
+      if (path === '/api/domains' && method === 'GET') {
+        return this.cors(this.json({ domains: this.domains }));
+      }
+      
+      if (path === '/api/stats' && method === 'GET') {
+        return this.cors(await this.getStats());
+      }
+      
+      if (path.startsWith('/api/inbox/') && path.endsWith('/stats') && method === 'GET') {
+        const address = decodeURIComponent(path.split('/')[3]);
+        return this.cors(await this.getInboxStats(address));
+      }
+      
+      if (path.startsWith('/api/inbox/') && path.endsWith('/renew') && method === 'POST') {
+        const address = decodeURIComponent(path.split('/')[3]);
+        return this.cors(await this.renewInbox(address));
+      }
+      
+      if (path.startsWith('/api/inbox/') && path.endsWith('/forward') && method === 'POST') {
+        const address = decodeURIComponent(path.split('/')[3]);
+        const body = await request.json().catch(() => ({}));
+        return this.cors(await this.setForward(address, body.forward_to));
+      }
+      
+      if (path.startsWith('/api/inbox/') && method === 'GET') {
+        const address = decodeURIComponent(path.split('/')[3]);
+        return this.cors(await this.getEmails(address));
+      }
+      
+      if (path.startsWith('/api/inbox/') && method === 'DELETE') {
+        const address = decodeURIComponent(path.split('/')[3]);
+        return this.cors(await this.deleteInbox(address));
+      }
+      
+      if (path.startsWith('/api/mail/') && method === 'DELETE') {
+        const id = path.split('/')[3];
+        return this.cors(await this.deleteEmail(id));
+      }
+      
+      if (path.startsWith('/api/mail/') && method === 'GET') {
+        const id = path.split('/')[3];
+        if (url.searchParams.get('format') === 'raw') {
+            return this.cors(await this.getRawEmail(id));
+        }
+        return this.cors(await this.getEmail(id));
+      }
+
+      return this.cors(this.json({ error: 'Not found' }, 404));
+    } catch (e) {
+      console.error(e);
+      return this.cors(this.json({ error: e.message }, 500));
+    }
+  }
+  
+  async scheduled(event) {
+    await this.cleanup();
+  }
+
+  async createInbox(prefix, domain) {
+    const selectedDomain = this.domains.includes(domain) ? domain : this.domains[0];
+    let name = prefix ? prefix.toLowerCase().replace(/[^a-z0-9]/g, '') : '';
+    if (!name || name.length < 3) name = this.randomName();
+    
+    let address = `${name}@${selectedDomain}`;
+    let exists = await this.db.prepare('SELECT 1 FROM inboxes WHERE address = ?').bind(address).first();
+    
+    if (exists) {
+        name = `${name}${this.randomName().slice(0, 3)}`;
+        address = `${name}@${selectedDomain}`;
+    }
+
+    const now = Date.now();
+    await this.db.prepare('INSERT INTO inboxes (address, created_at, expires_at) VALUES (?, ?, ?)')
+        .bind(address, now, now + this.ttl).run();
+    
+    return this.json({ address, expires_at: now + this.ttl });
+  }
+
+  async getEmails(address) {
+    const inbox = await this.db.prepare(
+      'SELECT * FROM inboxes WHERE address = ? AND expires_at > ?'
+    ).bind(address, Date.now()).first();
+
+    if (!inbox) {
+      return this.json({ error: 'Inbox not found or expired' }, 404);
+    }
+
+    const emails = await this.db.prepare(
+      'SELECT id, from_addr, subject, received_at FROM emails WHERE inbox_address = ? ORDER BY received_at DESC'
+    ).bind(address).all();
+
+    return this.json({ address, expires_at: inbox.expires_at, forward_to: inbox.forward_to || null, emails: emails.results });
+  }
+
+  async getEmail(id) {
+    const email = await this.db.prepare(
+      'SELECT id, inbox_address, from_addr, subject, body, received_at FROM emails WHERE id = ?'
+    ).bind(id).first();
+
+    if (!email) {
+      return this.json({ error: 'Email not found' }, 404);
+    }
+    return this.json(email);
+  }
+  
+  async getRawEmail(id) {
+      const email = await this.db.prepare(
+          'SELECT raw FROM emails WHERE id = ?'
+      ).bind(id).first();
+      
+      if (!email) return new Response('Not found', { status: 404 });
+      
+      return new Response(email.raw, {
+          headers: {
+              'Content-Type': 'message/rfc822',
+              'Content-Disposition': `attachment; filename="${id}.eml"`
+          }
+      });
+  }
+
+  async renewInbox(address) {
+    const inbox = await this.db.prepare(
+      'SELECT * FROM inboxes WHERE address = ?'
+    ).bind(address).first();
+    
+    if (!inbox) {
+      return this.json({ error: 'Inbox not found' }, 404);
+    }
+    
+    const newExpiry = Date.now() + this.ttl;
+    await this.db.prepare('UPDATE inboxes SET expires_at = ? WHERE address = ?')
+      .bind(newExpiry, address).run();
+    
+    return this.json({ address, expires_at: newExpiry });
+  }
+
+  async setForward(address, forwardTo) {
+    const inbox = await this.db.prepare(
+      'SELECT * FROM inboxes WHERE address = ?'
+    ).bind(address).first();
+    
+    if (!inbox) {
+      return this.json({ error: 'Inbox not found' }, 404);
+    }
+    
+    await this.db.prepare('UPDATE inboxes SET forward_to = ? WHERE address = ?')
+      .bind(forwardTo || null, address).run();
+    
+    return this.json({ address, forward_to: forwardTo || null });
+  }
+
+  async deleteEmail(id) {
+    await this.db.prepare('DELETE FROM emails WHERE id = ?').bind(id).run();
+    return this.json({ success: true });
+  }
+
+  async deleteInbox(address) {
+    await this.db.batch([
+        this.db.prepare('DELETE FROM emails WHERE inbox_address = ?').bind(address),
+        this.db.prepare('DELETE FROM inboxes WHERE address = ?').bind(address)
+    ]);
+    return this.json({ success: true });
+  }
+
+  async cleanup() {
+    const now = Date.now();
+    await this.db.prepare('DELETE FROM emails WHERE inbox_address IN (SELECT address FROM inboxes WHERE expires_at < ?)').bind(now).run();
+    await this.db.prepare('DELETE FROM inboxes WHERE expires_at < ?').bind(now).run();
+  }
+
+  async getStats() {
+    const totalInboxes = await this.db.prepare('SELECT COUNT(*) as count FROM inboxes').first();
+    const activeInboxes = await this.db.prepare('SELECT COUNT(*) as count FROM inboxes WHERE expires_at > ?').bind(Date.now()).first();
+    const totalEmails = await this.db.prepare('SELECT COUNT(*) as count FROM stats').first();
+    const todayEmails = await this.db.prepare('SELECT COUNT(*) as count FROM stats WHERE received_at > ?').bind(Date.now() - 86400000).first();
+    const topSenders = await this.db.prepare('SELECT from_addr, COUNT(*) as count FROM stats GROUP BY from_addr ORDER BY count DESC LIMIT 5').all();
+    const emailsByHour = await this.db.prepare(`SELECT (received_at / 3600000 % 24) as hour, COUNT(*) as count FROM stats WHERE received_at > ? GROUP BY hour ORDER BY hour`).bind(Date.now() - 86400000).all();
+    
+    return this.json({
+      total_inboxes: totalInboxes?.count || 0,
+      active_inboxes: activeInboxes?.count || 0,
+      total_emails: totalEmails?.count || 0,
+      today_emails: todayEmails?.count || 0,
+      top_senders: topSenders?.results || [],
+      emails_by_hour: emailsByHour?.results || []
+    });
+  }
+
+  async getInboxStats(address) {
+    const inbox = await this.db.prepare('SELECT * FROM inboxes WHERE address = ?').bind(address).first();
+    if (!inbox) return this.json({ error: 'Inbox not found' }, 404);
+    
+    const totalEmails = await this.db.prepare('SELECT COUNT(*) as count FROM emails WHERE inbox_address = ?').bind(address).first();
+    const topSenders = await this.db.prepare('SELECT from_addr, COUNT(*) as count FROM emails WHERE inbox_address = ? GROUP BY from_addr ORDER BY count DESC LIMIT 5').bind(address).all();
+    
+    return this.json({
+      address,
+      total_emails: totalEmails?.count || 0,
+      top_senders: topSenders?.results || []
+    });
+  }
+
+  randomName() {
+    const adjs = [
+      'cool', 'super', 'best', 'fast', 'blue', 'red', 'green', 'gold', 'silver', 'iron',
+      'happy', 'smart', 'swift', 'wild', 'calm', 'brave', 'neon', 'cyber', 'retro', 'pro',
+      'sky', 'star', 'moon', 'sun', 'cloud', 'rain', 'snow', 'wind', 'fire', 'ice'
+    ];
+    const nouns = [
+      'panda', 'tiger', 'lion', 'eagle', 'wolf', 'bear', 'fox', 'hawk', 'owl', 'cat',
+      'dog', 'bird', 'fish', 'shark', 'whale', 'duck', 'goose', 'swan', 'deer', 'elk',
+      'coder', 'dev', 'user', 'guest', 'admin', 'tester', 'runner', 'player', 'winner', 'hero',
+      'smith', 'jones', 'bond', 'doe', 'black', 'white', 'brown', 'green', 'scott', 'king'
+    ];
+    
+    const adj = adjs[Math.floor(Math.random() * adjs.length)];
+    const noun = nouns[Math.floor(Math.random() * nouns.length)];
+    const num = Math.floor(Math.random() * 1000); // 0-999
+    
+    // 纯字母组合，SaaS 风格更倾向于简洁
+    return `${adj}${noun}${num}`;
+  }
+
+  json(data, status = 200) {
+    return new Response(JSON.stringify(data), {
+      status,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  cors(response) {
+    response.headers.set('Access-Control-Allow-Origin', '*');
+    response.headers.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    response.headers.set('Access-Control-Allow-Headers', 'Content-Type');
+    return response;
+  }
+
+  html() {
+    const html = `<!DOCTYPE html>
+<html lang="zh-CN" class="h-full antialiased">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Mailfly - 临时邮箱服务</title>
+  <meta name="description" content="安全、快速的临时邮箱服务">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'sans-serif'] },
+          colors: {
+            gray: {
+              50: '#F9FAFB', 100: '#F3F4F6', 200: '#E5E7EB', 300: '#D1D5DB', 400: '#9CA3AF',
+              500: '#6B7280', 600: '#4B5563', 700: '#374151', 800: '#1F2937', 900: '#111827', 950: '#030712'
+            },
+            brand: {
+              50: '#eff6ff', 100: '#dbeafe', 200: '#bfdbfe', 300: '#93c5fd', 400: '#60a5fa',
+              500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8', 800: '#1e40af', 900: '#1e3a8a', 950: '#172554'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .scrollbar-hide::-webkit-scrollbar { display: none; }
+    .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+    iframe { width: 100%; height: 100%; border: none; display: block; }
+    .glass { background: rgba(255, 255, 255, 0.7); backdrop-filter: blur(10px); }
+    .dark .glass { background: rgba(17, 24, 39, 0.7); }
+    /* Animation for skeleton loading */
+    @keyframes shimmer {
+      0% { background-position: -200% 0; }
+      100% { background-position: 200% 0; }
+    }
+    .skeleton {
+      background: linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 50%, #f3f4f6 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+    }
+    .dark .skeleton {
+      background: linear-gradient(90deg, #1f2937 25%, #374151 50%, #1f2937 75%);
+    }
+  </style>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <!-- Phosphor Icons for a clean, technical look -->
+  <script src="https://unpkg.com/@phosphor-icons/web"></script>
+</head>
+<body class="h-full bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100 transition-colors duration-200"
+      x-data="app()" x-init="initApp()" @keydown.escape="selectedEmail = null">
+
+  <!-- Toast Notification -->
+  <div class="fixed top-5 left-1/2 -translate-x-1/2 z-[60] flex flex-col gap-2 pointer-events-none">
+    <template x-for="toast in toasts" :key="toast.id">
+      <div x-transition:enter="transform ease-out duration-300 transition"
+           x-transition:enter-start="-translate-y-2 opacity-0"
+           x-transition:enter-end="translate-y-0 opacity-100"
+           x-transition:leave="transition ease-in duration-100"
+           x-transition:leave-start="opacity-100"
+           x-transition:leave-end="opacity-0"
+           class="pointer-events-auto flex items-center w-full max-w-xs p-4 space-x-3 text-gray-500 bg-white rounded-lg shadow-lg dark:text-gray-400 dark:bg-gray-800 border border-gray-100 dark:border-gray-700">
+        <div class="inline-flex items-center justify-center flex-shrink-0 w-8 h-8 rounded-lg"
+             :class="toast.type === 'success' ? 'text-green-500 bg-green-100 dark:bg-green-800/30 dark:text-green-400' : 'text-red-500 bg-red-100 dark:bg-red-800/30 dark:text-red-400'">
+            <i class="ph" :class="toast.type === 'success' ? 'ph-check-circle' : 'ph-warning-circle'" style="font-size: 20px;"></i>
+        </div>
+        <div class="text-sm font-medium" x-text="toast.message"></div>
+      </div>
+    </template>
+  </div>
+
+  <div class="flex h-full overflow-hidden">
+  
+    <!-- Sidebar -->
+    <aside class="hidden md:flex flex-col w-64 border-r border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 z-20">
+      <div class="flex items-center h-16 px-6 border-b border-gray-100 dark:border-gray-800">
+        <div class="flex items-center gap-2.5 text-brand-600 dark:text-brand-500">
+          <i class="ph-fill ph-paper-plane-tilt text-2xl"></i>
+          <span class="text-lg font-bold tracking-tight text-gray-900 dark:text-white">Mailfly</span>
+        </div>
+      </div>
+      
+      <div class="flex-1 flex flex-col p-4 gap-6 overflow-y-auto">
+        
+        <!-- Current Inbox Card -->
+        <div class="flex flex-col gap-3">
+          <div class="flex items-center justify-between px-1">
+            <label class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">当前邮箱</label>
+            <button x-show="inboxes.length > 0" @click="showInboxList = !showInboxList" class="text-xs text-brand-600 hover:text-brand-700 font-medium">
+              <span x-text="showInboxList ? '收起' : '切换'"></span> (<span x-text="inboxes.length"></span>)
+            </button>
+          </div>
+          
+          <!-- Inbox List Dropdown -->
+          <div x-show="showInboxList && inboxes.length > 0" x-transition class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 divide-y divide-gray-100 dark:divide-gray-700 max-h-48 overflow-y-auto">
+            <template x-for="inbox in inboxes" :key="inbox.address">
+              <div @click="switchInbox(inbox)" class="px-3 py-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 flex justify-between items-center"
+                   :class="inbox.address === address ? 'bg-brand-50 dark:bg-brand-900/20' : ''">
+                <span class="text-xs font-mono truncate flex-1" x-text="inbox.address"></span>
+                <span class="text-[10px] text-gray-400 ml-2" x-text="getInboxTimeLeft(inbox)"></span>
+              </div>
+            </template>
+          </div>
+          
+          <div x-show="address" class="bg-gray-50 dark:bg-gray-800/50 rounded-xl p-4 border border-gray-100 dark:border-gray-800 shadow-sm group relative overflow-hidden">
+             <!-- Status Dot -->
+             <div class="absolute top-4 right-4 flex h-2.5 w-2.5">
+                <span class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75" :class="timeLeft > 60 ? 'bg-green-400' : 'bg-red-400'"></span>
+                <span class="relative inline-flex rounded-full h-2.5 w-2.5" :class="timeLeft > 60 ? 'bg-green-500' : 'bg-red-500'"></span>
+             </div>
+             
+             <div class="text-xs text-gray-500 dark:text-gray-400 mb-1">邮箱地址</div>
+             <div class="font-mono text-sm font-medium text-gray-900 dark:text-gray-100 break-all select-all mb-3" x-text="address"></div>
+             
+             <div class="flex gap-2">
+                <button @click="copyAddress()" class="flex-1 flex items-center justify-center gap-2 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 border border-gray-200 dark:border-gray-600 rounded-lg py-1.5 text-xs font-medium transition-colors text-gray-700 dark:text-gray-200">
+                  <i class="ph ph-copy"></i> 复制
+                </button>
+                <button @click="refreshMails()" class="px-3 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 border border-gray-200 dark:border-gray-600 rounded-lg py-1.5 text-gray-700 dark:text-gray-200 transition-colors">
+                  <i class="ph ph-arrows-clockwise" :class="{'animate-spin': loading}"></i>
+                </button>
+             </div>
+             
+             <div class="mt-3 pt-3 border-t border-gray-200 dark:border-gray-700 space-y-2">
+                 <div class="flex justify-between items-center text-xs">
+                   <span class="text-gray-500" x-text="timeLeftFormatted"></span>
+                 </div>
+                 <div class="grid grid-cols-2 gap-2">
+                   <button @click="showForwardModal = true" class="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-purple-600 hover:bg-purple-50 dark:hover:bg-purple-900/20 rounded-lg transition-colors">
+                     <i class="ph ph-arrow-bend-up-right"></i> 转发
+                   </button>
+                   <button @click="renewInbox()" class="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20 rounded-lg transition-colors">
+                     <i class="ph ph-clock-clockwise"></i> 续期
+                   </button>
+                   <button @click="createInbox()" class="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-900/20 rounded-lg transition-colors">
+                     <i class="ph ph-plus"></i> 新建
+                   </button>
+                   <button @click="deleteInbox()" class="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors">
+                     <i class="ph ph-stop"></i> 停止
+                   </button>
+                 </div>
+              </div>
+              
+              <!-- Forward Status -->
+              <div x-show="forwardTo" class="mt-2 text-xs text-purple-600 dark:text-purple-400 flex items-center gap-1">
+                <i class="ph ph-arrow-bend-up-right"></i>
+                <span>转发至: <span x-text="forwardTo" class="font-mono"></span></span>
+              </div>
+          </div>
+          
+          <div x-show="!address" class="text-center py-8 px-4 bg-gray-50 dark:bg-gray-800/50 rounded-xl border border-dashed border-gray-300 dark:border-gray-700">
+             <div class="text-sm text-gray-500 mb-3">暂无活动邮箱</div>
+             <button @click="createInbox()" class="w-full bg-brand-600 hover:bg-brand-700 text-white shadow-md shadow-brand-500/20 py-2 px-4 rounded-lg text-sm font-medium transition-all">
+                创建邮箱
+             </button>
+          </div>
+        </div>
+        
+        <!-- Controls -->
+        <div class="space-y-1">
+           <label class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider px-1 mb-2 block">设置</label>
+           
+           <div class="mb-4 px-1 space-y-2">
+             <input x-model="customPrefix" type="text" placeholder="自定义前缀（可选）" 
+                    class="w-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500 focus:border-transparent outline-none transition-all placeholder-gray-400">
+             <select x-model="selectedDomain" class="w-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500 focus:border-transparent outline-none transition-all">
+               <template x-for="d in domains" :key="d">
+                 <option :value="d" x-text="d"></option>
+               </template>
+             </select>
+           </div>
+
+           <button @click="toggleDark()" class="w-full flex items-center gap-3 px-3 py-2 text-sm font-medium text-gray-600 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+             <i class="ph" :class="isDark ? 'ph-sun' : 'ph-moon'"></i>
+             <span x-text="isDark ? '浅色模式' : '深色模式'"></span>
+           </button>
+           <button @click="showStatsModal = true" class="w-full flex items-center gap-3 px-3 py-2 text-sm font-medium text-gray-600 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+             <i class="ph ph-chart-bar"></i>
+             <span>统计面板</span>
+           </button>
+           <a href="https://git.specialz.org/Specialz/Mailfly" target="_blank" class="w-full flex items-center gap-3 px-3 py-2 text-sm font-medium text-gray-600 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+             <i class="ph ph-git-branch"></i>
+             <span>源代码</span>
+           </a>
+        </div>
+      </div>
+      
+      <div class="p-4 text-xs text-center text-gray-400 border-t border-gray-100 dark:border-gray-800">
+        v2.0.0 &bull; Made by Specialz
+      </div>
+    </aside>
+
+    <!-- Mobile Header -->
+    <header class="md:hidden fixed top-0 w-full bg-white/80 dark:bg-gray-900/80 backdrop-blur border-b border-gray-200 dark:border-gray-800 z-30 px-4 h-14 flex items-center justify-between">
+       <div class="flex items-center gap-2 font-bold text-gray-900 dark:text-white">
+         <i class="ph-fill ph-paper-plane-tilt text-brand-600"></i> Mailfly
+       </div>
+       <div class="flex items-center gap-2">
+         <button @click="createInbox()" x-show="!address" class="text-xs bg-brand-600 text-white px-3 py-1.5 rounded-md">新建</button>
+         <button @click="createInbox()" x-show="address" class="text-xs bg-brand-600 text-white px-3 py-1.5 rounded-md">新建</button>
+         <button @click="toggleDark()" class="p-2 text-gray-500"><i class="ph" :class="isDark ? 'ph-sun' : 'ph-moon'"></i></button>
+       </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="flex-1 flex flex-col h-full overflow-hidden pt-14 md:pt-0 relative w-full">
+      
+      <!-- Stats Header Bar -->
+      <div class="hidden md:flex items-center gap-6 px-6 py-4 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-brand-500 to-brand-600 flex items-center justify-center text-white">
+            <i class="ph ph-envelope text-xl"></i>
+          </div>
+          <div>
+            <div class="text-2xl font-bold text-gray-900 dark:text-white tabular-nums transition-all duration-500" x-text="animatedStats.today"></div>
+            <div class="text-xs text-gray-500">今日收件</div>
+          </div>
+        </div>
+        <div class="h-10 w-px bg-gray-200 dark:bg-gray-700"></div>
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-purple-500 to-purple-600 flex items-center justify-center text-white">
+            <i class="ph ph-stack text-xl"></i>
+          </div>
+          <div>
+            <div class="text-2xl font-bold text-gray-900 dark:text-white tabular-nums transition-all duration-500" x-text="animatedStats.total"></div>
+            <div class="text-xs text-gray-500">总收件</div>
+          </div>
+        </div>
+        <div class="h-10 w-px bg-gray-200 dark:bg-gray-700"></div>
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-green-500 to-green-600 flex items-center justify-center text-white">
+            <i class="ph ph-mailbox text-xl"></i>
+          </div>
+          <div>
+            <div class="text-2xl font-bold text-gray-900 dark:text-white tabular-nums transition-all duration-500" x-text="animatedStats.active"></div>
+            <div class="text-xs text-gray-500">活跃邮箱</div>
+          </div>
+        </div>
+        <div class="flex-1"></div>
+        <!-- Mini Trend Chart -->
+        <div class="flex items-end gap-0.5 h-8">
+          <template x-for="h in 12" :key="h">
+            <div class="w-1.5 bg-brand-500 rounded-t opacity-60 hover:opacity-100 transition-all duration-500 ease-out" 
+                 :style="'height: ' + getMiniChartHeight(h + 11) + 'px'"
+                 :title="(h + 11) + ':00'"></div>
+          </template>
+        </div>
+        <div class="text-xs text-gray-400">12h趋势</div>
+      </div>
+
+      <div class="flex-1 flex flex-col md:flex-row overflow-hidden">
+      <!-- Mail List -->
+      <div class="w-full md:w-80 lg:w-96 flex flex-col border-r border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 h-full z-10"
+           :class="{'hidden md:flex': selectedEmail && isMobile}">
+        
+        <!-- Mobile Controls (Only visible on mobile when list is shown) -->
+        <div class="md:hidden p-4 bg-gray-50 dark:bg-gray-800/50 border-b border-gray-200 dark:border-gray-700" x-show="address">
+           <div class="flex justify-between items-center mb-2">
+             <div class="text-sm font-mono truncate max-w-[200px]" x-text="address"></div>
+             <button @click="copyAddress()" class="text-brand-600 text-xs font-medium">复制</button>
+           </div>
+           <div class="flex justify-between text-xs text-gray-500">
+             <span x-text="timeLeftFormatted"></span>
+             <button @click="refreshMails()" class="flex items-center gap-1"><i class="ph ph-arrows-clockwise"></i> 刷新</button>
+           </div>
+        </div>
+
+        <div class="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-800 flex-shrink-0 bg-white dark:bg-gray-900">
+          <h2 class="font-semibold text-gray-900 dark:text-white">收件箱</h2>
+          <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400" x-text="emails.length"></span>
+        </div>
+
+        <div class="flex-1 overflow-y-auto custom-scroll relative">
+           <!-- Empty State -->
+           <div x-show="emails.length === 0 && !loading" class="flex flex-col items-center justify-center h-full p-6 text-center text-gray-500">
+              <div class="w-16 h-16 bg-gray-50 dark:bg-gray-800 rounded-2xl flex items-center justify-center mb-4 text-gray-300 dark:text-gray-600">
+                 <i class="ph-duotone ph-inbox text-4xl"></i>
+              </div>
+              <p class="text-sm" x-text="address ? '等待邮件中...' : '创建邮箱以开始'"></p>
+           </div>
+           
+           <!-- Loading Skeletons -->
+           <div x-show="loading && emails.length === 0" class="p-4 space-y-4">
+              <template x-for="i in 3">
+                 <div class="flex gap-3">
+                    <div class="w-10 h-10 rounded-full skeleton flex-shrink-0"></div>
+                    <div class="flex-1 space-y-2">
+                       <div class="h-4 w-3/4 skeleton rounded"></div>
+                       <div class="h-3 w-1/2 skeleton rounded"></div>
+                    </div>
+                 </div>
+              </template>
+           </div>
+
+           <!-- List -->
+           <ul class="divide-y divide-gray-100 dark:divide-gray-800">
+             <template x-for="email in emails" :key="email.id">
+               <li @click="selectEmail(email)" 
+                   class="group relative p-4 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-all border-l-[3px]"
+                   :class="selectedEmail?.id === email.id ? 'bg-brand-50/50 dark:bg-brand-900/10 border-brand-500' : 'border-transparent'">
+                 
+                 <div class="flex gap-3 items-start">
+                   <!-- Avatar -->
+                   <div class="flex-shrink-0 w-9 h-9 rounded-full bg-gradient-to-br flex items-center justify-center text-white text-sm font-bold shadow-sm"
+                        :class="getAvatarColor(email.from_addr)">
+                      <span x-text="email.from_addr.charAt(0).toUpperCase()"></span>
+                   </div>
+                   
+                   <div class="flex-1 min-w-0">
+                     <div class="flex justify-between items-baseline mb-0.5">
+                       <span class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate pr-2" x-text="email.from_addr"></span>
+                       <span class="text-[10px] text-gray-400 flex-shrink-0" x-text="formatDate(email.received_at)"></span>
+                     </div>
+                     <div class="text-xs font-medium text-gray-700 dark:text-gray-300 truncate mb-0.5" x-text="email.subject || '(无主题)'"></div>
+                     <div class="text-xs text-gray-400 truncate">点击查看内容...</div>
+                   </div>
+                 </div>
+               </li>
+             </template>
+           </ul>
+        </div>
+      </div>
+
+      <!-- Preview Area -->
+      <div class="flex-1 flex flex-col bg-gray-50 dark:bg-gray-950 h-full overflow-hidden absolute md:static inset-0 z-20 bg-white"
+           x-show="selectedEmail || !isMobile"
+           x-transition:enter="transform transition ease-in-out duration-300"
+           x-transition:enter-start="translate-x-full"
+           x-transition:enter-end="translate-x-0">
+        
+        <template x-if="!selectedEmail">
+           <div class="hidden md:flex flex-col items-center justify-center h-full text-gray-400">
+              <div class="w-20 h-20 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center mb-6">
+                <i class="ph-duotone ph-envelope-open text-4xl text-gray-300 dark:text-gray-600"></i>
+              </div>
+              <p class="text-sm font-medium">选择一封邮件查看</p>
+           </div>
+        </template>
+
+        <template x-if="selectedEmail">
+           <div class="flex flex-col h-full bg-white dark:bg-gray-900 shadow-xl md:shadow-none">
+              <!-- Detail Header -->
+              <div class="px-6 py-5 border-b border-gray-200 dark:border-gray-800 flex-shrink-0 bg-white dark:bg-gray-900">
+                 <div class="flex items-center gap-3 md:hidden mb-4">
+                    <button @click="selectedEmail = null" class="p-1 -ml-1 text-gray-500 hover:text-gray-900 dark:hover:text-white">
+                       <i class="ph ph-arrow-left text-xl"></i>
+                    </button>
+                    <span class="font-semibold text-sm">返回</span>
+                 </div>
+                 
+                 <div class="flex justify-between items-start gap-4">
+                    <h1 class="text-lg md:text-xl font-bold text-gray-900 dark:text-white leading-tight" x-text="selectedEmail.subject"></h1>
+                    <div class="flex gap-2">
+                       <a :href="'/api/mail/' + selectedEmail.id + '?format=raw'" target="_blank" class="p-2 text-gray-400 hover:text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-900/20 rounded-lg transition-colors" title="下载 .eml">
+                          <i class="ph ph-download-simple text-lg"></i>
+                       </a>
+                       <button @click="deleteEmail(selectedEmail.id)" class="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors" title="删除邮件">
+                          <i class="ph ph-trash text-lg"></i>
+                       </button>
+                       <button @click="deleteInbox()" class="md:hidden p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg">
+                          <i class="ph ph-trash text-lg"></i>
+                       </button>
+                    </div>
+                 </div>
+                 
+                 <div class="mt-4 flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-full bg-gray-100 dark:bg-gray-800 flex items-center justify-center text-gray-500 text-lg font-bold">
+                       <span x-text="selectedEmail.from_addr.charAt(0).toUpperCase()"></span>
+                    </div>
+                    <div class="flex-1 min-w-0">
+                       <div class="flex items-baseline gap-2">
+                          <span class="text-sm font-semibold text-gray-900 dark:text-white truncate" x-text="extractName(selectedEmail.from_addr)"></span>
+                          <span class="text-xs text-gray-500 truncate" x-text="'<' + selectedEmail.from_addr + '>'"></span>
+                       </div>
+                       <div class="text-xs text-gray-400 mt-0.5">
+                          收件人: <span x-text="address"></span> &bull; <span x-text="new Date(selectedEmail.received_at).toLocaleString()"></span>
+                       </div>
+                    </div>
+                 </div>
+              </div>
+              
+              <!-- Content -->
+              <div class="flex-1 relative bg-white dark:bg-gray-900">
+                 <div x-show="loadingBody" class="absolute inset-0 flex items-center justify-center bg-white/80 dark:bg-gray-900/80 z-20">
+                    <i class="ph ph-spinner animate-spin text-brand-600 text-2xl"></i>
+                 </div>
+                 <iframe id="mailFrame" class="w-full h-full" sandbox="allow-popups allow-popups-to-escape-sandbox allow-same-origin"></iframe>
+              </div>
+           </div>
+        </template>
+      </div>
+
+    </main>
+    </div>
+  </div>
+
+  <!-- Forward Modal -->
+  <div x-show="showForwardModal" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" @click.self="showForwardModal = false">
+    <div class="bg-white dark:bg-gray-800 rounded-xl p-6 w-full max-w-sm mx-4 shadow-2xl">
+      <h3 class="text-lg font-bold text-gray-900 dark:text-white mb-4">邮件转发设置</h3>
+      <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">收到新邮件时自动转发到指定邮箱</p>
+      <input x-model="forwardInput" type="email" placeholder="转发目标邮箱（留空取消转发）"
+             class="w-full bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 text-sm mb-4 focus:ring-2 focus:ring-brand-500 outline-none">
+      <div class="flex gap-3">
+        <button @click="showForwardModal = false" class="flex-1 px-4 py-2 text-sm font-medium text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600">取消</button>
+        <button @click="setForward()" class="flex-1 px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-lg hover:bg-brand-700">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stats Modal -->
+  <div x-show="showStatsModal" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" @click.self="showStatsModal = false">
+    <div class="bg-white dark:bg-gray-800 rounded-xl p-6 w-full max-w-lg mx-4 shadow-2xl max-h-[80vh] overflow-y-auto">
+      <div class="flex justify-between items-center mb-6">
+        <h3 class="text-lg font-bold text-gray-900 dark:text-white">统计面板</h3>
+        <button @click="showStatsModal = false" class="text-gray-400 hover:text-gray-600"><i class="ph ph-x text-xl"></i></button>
+      </div>
+      
+      <div x-show="!stats" class="text-center py-8 text-gray-500">
+        <i class="ph ph-spinner animate-spin text-2xl"></i>
+        <p class="mt-2 text-sm">加载中...</p>
+      </div>
+      
+      <div x-show="stats" class="space-y-6">
+        <!-- Overview Cards -->
+        <div class="grid grid-cols-2 gap-4">
+          <div class="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-4">
+            <div class="text-2xl font-bold text-brand-600" x-text="stats?.total_inboxes || 0"></div>
+            <div class="text-xs text-gray-500">总邮箱数</div>
+          </div>
+          <div class="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-4">
+            <div class="text-2xl font-bold text-green-600" x-text="stats?.active_inboxes || 0"></div>
+            <div class="text-xs text-gray-500">活跃邮箱</div>
+          </div>
+          <div class="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-4">
+            <div class="text-2xl font-bold text-purple-600" x-text="stats?.total_emails || 0"></div>
+            <div class="text-xs text-gray-500">总邮件数</div>
+          </div>
+          <div class="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-4">
+            <div class="text-2xl font-bold text-orange-600" x-text="stats?.today_emails || 0"></div>
+            <div class="text-xs text-gray-500">今日邮件</div>
+          </div>
+        </div>
+        
+        <!-- Top Senders -->
+        <div>
+          <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">发件人排行</h4>
+          <div class="space-y-2">
+            <template x-for="(sender, idx) in (stats?.top_senders || [])" :key="sender.from_addr">
+              <div class="flex items-center justify-between bg-gray-50 dark:bg-gray-700/50 rounded-lg px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <span class="text-xs font-bold text-gray-400" x-text="idx + 1"></span>
+                  <span class="text-sm font-mono truncate max-w-[200px]" x-text="sender.from_addr"></span>
+                </div>
+                <span class="text-xs font-medium text-brand-600" x-text="sender.count + ' 封'"></span>
+              </div>
+            </template>
+            <div x-show="!stats?.top_senders?.length" class="text-center text-sm text-gray-400 py-4">暂无数据</div>
+          </div>
+        </div>
+        
+        <!-- Hourly Chart -->
+        <div>
+          <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">24小时邮件分布</h4>
+          <div class="flex items-end gap-1 h-20 bg-gray-50 dark:bg-gray-700/50 rounded-lg p-2">
+            <template x-for="h in 24" :key="h">
+              <div class="flex-1 bg-brand-500 rounded-t transition-all" 
+                   :style="'height: ' + getHourHeight(h-1) + '%'"
+                   :title="(h-1) + ':00 - ' + getHourCount(h-1) + ' 封'"></div>
+            </template>
+          </div>
+          <div class="flex justify-between text-[10px] text-gray-400 mt-1 px-1">
+            <span>0时</span><span>6时</span><span>12时</span><span>18时</span><span>24时</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function app() {
+      return {
+        isDark: false,
+        domains: [],
+        selectedDomain: '',
+        inboxes: JSON.parse(localStorage.getItem('tm_inboxes') || '[]'),
+        address: localStorage.getItem('tm_addr') || '',
+        expiresAt: parseInt(localStorage.getItem('tm_exp')) || 0,
+        forwardTo: '',
+        showForwardModal: false,
+        forwardInput: '',
+        showStatsModal: false,
+        stats: null,
+        animatedStats: { today: 0, total: 0, active: 0 },
+        emails: [],
+        selectedEmail: null,
+        loading: false,
+        loadingBody: false,
+        timeLeft: 0,
+        customPrefix: '',
+        timer: null,
+        refreshTimer: null,
+        toasts: [],
+        isMobile: window.innerWidth < 768,
+        showInboxList: false,
+
+        get timeLeftFormatted() {
+            if (this.timeLeft <= 0) return '已过期';
+            const m = Math.floor(this.timeLeft / 60);
+            const s = this.timeLeft % 60;
+            return m + '分 ' + s + '秒 剩余';
+        },
+
+        initApp() {
+            this.loadTheme();
+            this.loadDomains();
+            this.loadStats();
+            this.cleanExpiredInboxes();
+            this.requestNotificationPermission();
+            window.addEventListener('resize', () => this.isMobile = window.innerWidth < 768);
+            window.addEventListener('keydown', (e) => this.handleKeyboard(e));
+            
+            if (this.address && this.expiresAt > Date.now()) {
+                this.refreshMails();
+                this.startTimer();
+            } else {
+                this.logout();
+            }
+
+            this.refreshTimer = setInterval(() => {
+                if(this.address && !document.hidden) this.refreshMails(true);
+                this.loadStats();
+            }, 10000);
+        },
+
+        handleKeyboard(e) {
+            if (e.target.tagName === 'INPUT') return;
+            if (e.key === 'r' || e.key === 'R') { e.preventDefault(); this.refreshMails(); }
+            if (e.key === 'n' || e.key === 'N') { e.preventDefault(); this.createInbox(); }
+            if (e.key === 'c' || e.key === 'C') { e.preventDefault(); this.copyAddress(); }
+            if (e.key === 'Escape') { this.selectedEmail = null; }
+        },
+
+        requestNotificationPermission() {
+            if ('Notification' in window && Notification.permission === 'default') {
+                Notification.requestPermission();
+            }
+        },
+
+        sendNotification(title, body) {
+            if ('Notification' in window && Notification.permission === 'granted') {
+                new Notification(title, { body, icon: '/favicon.ico' });
+            }
+        },
+
+        loadTheme() {
+            if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                this.isDark = true;
+                document.documentElement.classList.add('dark');
+            }
+        },
+
+        toggleDark() {
+            this.isDark = !this.isDark;
+            document.documentElement.classList.toggle('dark');
+            localStorage.theme = this.isDark ? 'dark' : 'light';
+        },
+
+        showToast(message, type = 'success') {
+            const id = Date.now();
+            this.toasts.push({ id, message, type });
+            setTimeout(() => {
+                this.toasts = this.toasts.filter(t => t.id !== id);
+            }, 3000);
+        },
+
+        async loadDomains() {
+            try {
+                const res = await fetch('/api/domains');
+                const data = await res.json();
+                this.domains = data.domains || [];
+                if (this.domains.length > 0) this.selectedDomain = this.domains[0];
+            } catch(e) {}
+        },
+
+        async createInbox() {
+            this.loading = true;
+            try {
+                const res = await fetch('/api/inbox', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prefix: this.customPrefix, domain: this.selectedDomain || this.domains[0] })
+                });
+                const data = await res.json();
+                this.address = data.address;
+                this.expiresAt = data.expires_at;
+                this.emails = [];
+                this.selectedEmail = null;
+                
+                this.saveCurrentInbox();
+                this.startTimer();
+                this.showToast('邮箱创建成功');
+            } catch(e) { 
+                this.showToast('创建邮箱失败', 'error'); 
+            }
+            this.loading = false;
+        },
+
+        async refreshMails(silent = false) {
+            if (!this.address) return;
+            if (!silent) this.loading = true;
+            
+            try {
+                const res = await fetch('/api/inbox/' + encodeURIComponent(this.address));
+                if (res.status === 404) {
+                    this.logout();
+                    return;
+                }
+                const data = await res.json();
+                this.expiresAt = data.expires_at;
+                this.forwardTo = data.forward_to || '';
+                localStorage.setItem('tm_exp', this.expiresAt);
+                this.saveCurrentInbox();
+                
+                if (data.emails.length > this.emails.length && this.emails.length > 0) {
+                   this.showToast('收到新邮件！');
+                   this.sendNotification('Mailfly - 新邮件', data.emails[0].subject || '(无主题)');
+                }
+                this.emails = data.emails;
+            } catch(e) {}
+            
+            if (!silent) this.loading = false;
+        },
+
+        async selectEmail(email) {
+            this.selectedEmail = email;
+            this.loadingBody = true;
+            
+            try {
+                const res = await fetch('/api/mail/' + email.id);
+                const data = await res.json();
+                this.renderEmailBody(data.body);
+            } catch(e) {
+                this.showToast('加载邮件失败', 'error');
+            }
+            this.loadingBody = false;
+        },
+
+        renderEmailBody(content) {
+            const frame = document.getElementById('mailFrame');
+            if (!frame) return;
+            
+            // 使用 srcdoc 或直接操作 DOM，避免 document.write 和 script 标签嵌套问题
+            const doc = frame.contentWindow.document;
+            doc.open();
+            doc.close(); // 清空
+
+            const head = doc.head;
+            const body = doc.body;
+
+            // 注入样式
+            const style = doc.createElement('style');
+            const bg = this.isDark ? '#111827' : '#ffffff';
+            const fg = this.isDark ? '#e5e7eb' : '#1f2937';
+            const link = this.isDark ? '#60a5fa' : '#2563eb';
+            
+            style.textContent = 
+                'body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 24px; line-height: 1.6; word-wrap: break-word; background: ' + bg + '; color: ' + fg + '; }' +
+                'a { color: ' + link + '; }' +
+                'img { max-width: 100%; height: auto; border-radius: 4px; }' +
+                'blockquote { border-left: 3px solid #ccc; margin-left: 0; padding-left: 12px; opacity: 0.8; }';
+            head.appendChild(style);
+
+            // 注入链接拦截脚本
+            const script = doc.createElement('script');
+            script.textContent = 'document.addEventListener("click", function(e) { if(e.target.tagName === "A") { e.preventDefault(); window.open(e.target.href, "_blank"); } });';
+            head.appendChild(script);
+
+            // 注入内容
+            if (content) {
+                body.innerHTML = content;
+            } else {
+                body.innerHTML = '<div style="opacity:0.5">无内容</div>';
+            }
+        },
+
+        async renewInbox() {
+            if (!this.address) return;
+            try {
+                const res = await fetch('/api/inbox/' + encodeURIComponent(this.address) + '/renew', { method: 'POST' });
+                const data = await res.json();
+                this.expiresAt = data.expires_at;
+                this.saveCurrentInbox();
+                this.startTimer();
+                this.showToast('续期成功');
+            } catch(e) {
+                this.showToast('续期失败', 'error');
+            }
+        },
+
+        async deleteEmail(id) {
+            await fetch('/api/mail/' + id, { method: 'DELETE' });
+            this.emails = this.emails.filter(e => e.id !== id);
+            if (this.selectedEmail?.id === id) this.selectedEmail = null;
+            this.showToast('邮件已删除');
+        },
+
+        async setForward() {
+            if (!this.address) return;
+            try {
+                const res = await fetch('/api/inbox/' + encodeURIComponent(this.address) + '/forward', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ forward_to: this.forwardInput || null })
+                });
+                const data = await res.json();
+                this.forwardTo = data.forward_to || '';
+                this.showForwardModal = false;
+                this.showToast(this.forwardTo ? '转发已设置' : '转发已取消');
+            } catch(e) {
+                this.showToast('设置失败', 'error');
+            }
+        },
+
+        async loadStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const newStats = await res.json();
+                if (this.stats) {
+                    this.animateStats(newStats);
+                } else {
+                    this.animatedStats = {
+                        today: newStats.today_emails || 0,
+                        total: newStats.total_emails || 0,
+                        active: newStats.active_inboxes || 0
+                    };
+                }
+                this.stats = newStats;
+            } catch(e) {}
+        },
+
+        animateStats(newStats) {
+            const targets = {
+                today: newStats.today_emails || 0,
+                total: newStats.total_emails || 0,
+                active: newStats.active_inboxes || 0
+            };
+            const duration = 500;
+            const start = performance.now();
+            const startValues = { ...this.animatedStats };
+            
+            const animate = (now) => {
+                const elapsed = now - start;
+                const progress = Math.min(elapsed / duration, 1);
+                const eased = 1 - Math.pow(1 - progress, 3);
+                
+                this.animatedStats.today = Math.round(startValues.today + (targets.today - startValues.today) * eased);
+                this.animatedStats.total = Math.round(startValues.total + (targets.total - startValues.total) * eased);
+                this.animatedStats.active = Math.round(startValues.active + (targets.active - startValues.active) * eased);
+                
+                if (progress < 1) requestAnimationFrame(animate);
+            };
+            requestAnimationFrame(animate);
+        },
+
+        getHourCount(hour) {
+            if (!this.stats?.emails_by_hour) return 0;
+            const found = this.stats.emails_by_hour.find(h => h.hour === hour);
+            return found?.count || 0;
+        },
+
+        getHourHeight(hour) {
+            if (!this.stats?.emails_by_hour?.length) return 5;
+            const max = Math.max(...this.stats.emails_by_hour.map(h => h.count), 1);
+            const count = this.getHourCount(hour);
+            return Math.max(5, (count / max) * 100);
+        },
+
+        getMiniChartHeight(hour) {
+            if (!this.stats?.emails_by_hour?.length) return 4;
+            const max = Math.max(...this.stats.emails_by_hour.map(h => h.count), 1);
+            const count = this.getHourCount(hour);
+            return Math.max(4, (count / max) * 32);
+        },
+
+        async deleteInbox() {
+            if (!this.address) return;
+            await fetch('/api/inbox/' + encodeURIComponent(this.address), { method: 'DELETE' });
+            this.removeInboxFromList(this.address);
+            this.logout();
+            this.showToast('邮箱已删除');
+        },
+
+        logout() {
+            this.address = '';
+            this.expiresAt = 0;
+            this.emails = [];
+            this.selectedEmail = null;
+            this.timeLeft = 0;
+            localStorage.removeItem('tm_addr');
+            localStorage.removeItem('tm_exp');
+            if (this.timer) clearInterval(this.timer);
+        },
+
+        saveCurrentInbox() {
+            const existing = this.inboxes.find(i => i.address === this.address);
+            if (existing) {
+                existing.expiresAt = this.expiresAt;
+            } else {
+                this.inboxes.push({ address: this.address, expiresAt: this.expiresAt });
+            }
+            localStorage.setItem('tm_inboxes', JSON.stringify(this.inboxes));
+            localStorage.setItem('tm_addr', this.address);
+            localStorage.setItem('tm_exp', this.expiresAt);
+        },
+
+        removeInboxFromList(addr) {
+            this.inboxes = this.inboxes.filter(i => i.address !== addr);
+            localStorage.setItem('tm_inboxes', JSON.stringify(this.inboxes));
+        },
+
+        cleanExpiredInboxes() {
+            const now = Date.now();
+            this.inboxes = this.inboxes.filter(i => i.expiresAt > now);
+            localStorage.setItem('tm_inboxes', JSON.stringify(this.inboxes));
+        },
+
+        switchInbox(inbox) {
+            this.address = inbox.address;
+            this.expiresAt = inbox.expiresAt;
+            this.emails = [];
+            this.selectedEmail = null;
+            localStorage.setItem('tm_addr', this.address);
+            localStorage.setItem('tm_exp', this.expiresAt);
+            this.startTimer();
+            this.refreshMails();
+            this.showInboxList = false;
+            this.showToast('已切换邮箱');
+        },
+
+        getInboxTimeLeft(inbox) {
+            const left = Math.max(0, Math.floor((inbox.expiresAt - Date.now()) / 1000));
+            if (left <= 0) return '已过期';
+            const m = Math.floor(left / 60);
+            return m + '分钟';
+        },
+
+        copyAddress() {
+            if (!this.address) return;
+            navigator.clipboard.writeText(this.address);
+            this.showToast('已复制到剪贴板');
+        },
+
+        startTimer() {
+            if (this.timer) clearInterval(this.timer);
+            const tick = () => {
+                const now = Date.now();
+                this.timeLeft = Math.max(0, Math.floor((this.expiresAt - now) / 1000));
+                if (this.timeLeft === 0) this.logout();
+            };
+            tick();
+            this.timer = setInterval(tick, 1000);
+        },
+
+        formatDate(ts) {
+            const date = new Date(ts);
+            const now = new Date();
+            if (date.toDateString() === now.toDateString()) {
+                return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            }
+            return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+        },
+
+        getAvatarColor(name) {
+            const colors = [
+                'from-blue-400 to-indigo-500', 'from-emerald-400 to-teal-500', 
+                'from-orange-400 to-pink-500', 'from-purple-400 to-violet-500',
+                'from-cyan-400 to-blue-500', 'from-rose-400 to-red-500'
+            ];
+            let hash = 0;
+            for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+            return colors[Math.abs(hash) % colors.length];
+        },
+
+        extractName(email) {
+            return email.split('@')[0];
+        }
+      }
+    }
+  </script>
+</body>
+</html>`;
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  }
+}

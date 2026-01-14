@@ -1,0 +1,19 @@
+{
+  "name": "mailfly",
+  "main": "src/index.js",
+  "compatibility_date": "2024-01-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mailfly-db",
+      "database_id": "your-database-id-here"
+    }
+  ],
+  "vars": {
+    "DOMAINS": "example.com,mail.example.org",
+    "MAIL_TTL": "3600"
+  },
+  "triggers": {
+    "crons": ["0 0 * * *"]
+  }
+}
