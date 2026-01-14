@@ -605,13 +605,16 @@ export class ApiHandler {
                    <button @click="renewInbox()" class="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20 rounded-lg transition-colors">
                      <i class="ph ph-clock-clockwise"></i> 续期
                    </button>
+                   <button @click="showKeyModal = true" class="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-orange-600 hover:bg-orange-50 dark:hover:bg-orange-900/20 rounded-lg transition-colors">
+                     <i class="ph ph-key"></i> 密钥
+                   </button>
                    <button @click="createInbox()" class="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-900/20 rounded-lg transition-colors">
                      <i class="ph ph-plus"></i> 新建
                    </button>
-                   <button @click="deleteInbox()" class="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors">
-                     <i class="ph ph-stop"></i> 停止
-                   </button>
                  </div>
+                 <button @click="deleteInbox()" class="w-full flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors mt-2">
+                   <i class="ph ph-stop"></i> 停止邮箱
+                 </button>
               </div>
               
               <!-- Forward Status -->
@@ -623,8 +626,11 @@ export class ApiHandler {
           
           <div x-show="!address" class="text-center py-8 px-4 bg-gray-50 dark:bg-gray-800/50 rounded-xl border border-dashed border-gray-300 dark:border-gray-700">
              <div class="text-sm text-gray-500 mb-3">暂无活动邮箱</div>
-             <button @click="createInbox()" class="w-full bg-brand-600 hover:bg-brand-700 text-white shadow-md shadow-brand-500/20 py-2 px-4 rounded-lg text-sm font-medium transition-all">
+             <button @click="createInbox()" class="w-full bg-brand-600 hover:bg-brand-700 text-white shadow-md shadow-brand-500/20 py-2 px-4 rounded-lg text-sm font-medium transition-all mb-2">
                 创建邮箱
+             </button>
+             <button @click="showImportModal = true" class="w-full bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 py-2 px-4 rounded-lg text-sm font-medium transition-all">
+                导入邮箱
              </button>
           </div>
         </div>
@@ -730,11 +736,48 @@ export class ApiHandler {
         <div class="md:hidden p-4 bg-gray-50 dark:bg-gray-800/50 border-b border-gray-200 dark:border-gray-700" x-show="address">
            <div class="flex justify-between items-center mb-2">
              <div class="text-sm font-mono truncate max-w-[200px]" x-text="address"></div>
-             <button @click="copyAddress()" class="text-brand-600 text-xs font-medium">复制</button>
+             <div class="flex gap-2">
+               <button @click="copyAddress()" class="text-brand-600 text-xs font-medium">复制</button>
+               <button @click="showMobileMenu = !showMobileMenu" class="text-gray-600 dark:text-gray-400 text-xs font-medium">
+                 <i class="ph ph-dots-three-vertical"></i>
+               </button>
+             </div>
            </div>
-           <div class="flex justify-between text-xs text-gray-500">
+           <div class="flex justify-between text-xs text-gray-500 mb-2">
              <span x-text="timeLeftFormatted"></span>
              <button @click="refreshMails()" class="flex items-center gap-1"><i class="ph ph-arrows-clockwise"></i> 刷新</button>
+           </div>
+
+           <!-- Mobile Menu -->
+           <div x-show="showMobileMenu" x-transition class="mt-3 pt-3 border-t border-gray-200 dark:border-gray-700 grid grid-cols-2 gap-2">
+             <button @click="showInboxList = true; showMobileMenu = false" x-show="inboxes.length > 1" class="flex items-center justify-center gap-1 py-2 text-xs font-medium text-gray-600 dark:text-gray-300 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+               <i class="ph ph-swap"></i> 切换
+             </button>
+             <button @click="showForwardModal = true; showMobileMenu = false" class="flex items-center justify-center gap-1 py-2 text-xs font-medium text-purple-600 bg-purple-50 dark:bg-purple-900/20 rounded-lg">
+               <i class="ph ph-arrow-bend-up-right"></i> 转发
+             </button>
+             <button @click="renewInbox(); showMobileMenu = false" class="flex items-center justify-center gap-1 py-2 text-xs font-medium text-green-600 bg-green-50 dark:bg-green-900/20 rounded-lg">
+               <i class="ph ph-clock-clockwise"></i> 续期
+             </button>
+             <button @click="showKeyModal = true; showMobileMenu = false" class="flex items-center justify-center gap-1 py-2 text-xs font-medium text-orange-600 bg-orange-50 dark:bg-orange-900/20 rounded-lg">
+               <i class="ph ph-key"></i> 密钥
+             </button>
+             <button @click="deleteInbox(); showMobileMenu = false" class="col-span-2 flex items-center justify-center gap-1 py-2 text-xs font-medium text-red-500 bg-red-50 dark:bg-red-900/20 rounded-lg">
+               <i class="ph ph-stop"></i> 停止邮箱
+             </button>
+           </div>
+        </div>
+
+        <!-- Mobile No Address -->
+        <div class="md:hidden p-4 bg-gray-50 dark:bg-gray-800/50 border-b border-gray-200 dark:border-gray-700 text-center" x-show="!address">
+           <div class="text-sm text-gray-500 mb-3">暂无活动邮箱</div>
+           <div class="flex gap-2">
+             <button @click="createInbox()" class="flex-1 bg-brand-600 hover:bg-brand-700 text-white py-2 px-4 rounded-lg text-xs font-medium">
+                创建邮箱
+             </button>
+             <button @click="showImportModal = true" class="flex-1 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 py-2 px-4 rounded-lg text-xs font-medium">
+                导入邮箱
+             </button>
            </div>
         </div>
 
@@ -891,6 +934,35 @@ export class ApiHandler {
     </div>
   </div>
 
+  <!-- Key Modal -->
+  <div x-show="showKeyModal" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" @click.self="showKeyModal = false">
+    <div class="bg-white dark:bg-gray-800 rounded-xl p-6 w-full max-w-sm mx-4 shadow-2xl">
+      <h3 class="text-lg font-bold text-gray-900 dark:text-white mb-4">邮箱访问密钥</h3>
+      <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">请妥善保存此密钥，用于在其他设备访问此邮箱</p>
+      <div class="bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 text-sm mb-4 font-mono break-all select-all" x-text="accessKey"></div>
+      <div class="flex gap-3">
+        <button @click="showKeyModal = false" class="flex-1 px-4 py-2 text-sm font-medium text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600">关闭</button>
+        <button @click="copyKey()" class="flex-1 px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-lg hover:bg-brand-700">复制密钥</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Import Modal -->
+  <div x-show="showImportModal" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" @click.self="showImportModal = false">
+    <div class="bg-white dark:bg-gray-800 rounded-xl p-6 w-full max-w-sm mx-4 shadow-2xl">
+      <h3 class="text-lg font-bold text-gray-900 dark:text-white mb-4">导入邮箱</h3>
+      <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">输入邮箱地址和访问密钥来恢复邮箱</p>
+      <input x-model="importAddress" type="email" placeholder="邮箱地址"
+             class="w-full bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 text-sm mb-3 focus:ring-2 focus:ring-brand-500 outline-none">
+      <input x-model="importKey" type="text" placeholder="访问密钥"
+             class="w-full bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 text-sm mb-4 focus:ring-2 focus:ring-brand-500 outline-none font-mono">
+      <div class="flex gap-3">
+        <button @click="showImportModal = false" class="flex-1 px-4 py-2 text-sm font-medium text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600">取消</button>
+        <button @click="importInbox()" class="flex-1 px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-lg hover:bg-brand-700">导入</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Stats Modal -->
   <div x-show="showStatsModal" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" @click.self="showStatsModal = false">
     <div class="bg-white dark:bg-gray-800 rounded-xl p-6 w-full max-w-lg mx-4 shadow-2xl max-h-[80vh] overflow-y-auto">
@@ -974,6 +1046,11 @@ export class ApiHandler {
         showForwardModal: false,
         forwardInput: '',
         showStatsModal: false,
+        showKeyModal: false,
+        showImportModal: false,
+        showMobileMenu: false,
+        importAddress: '',
+        importKey: '',
         stats: null,
         animatedStats: { today: 0, total: 0, active: 0 },
         emails: [],
@@ -1362,6 +1439,40 @@ export class ApiHandler {
             if (!this.address) return;
             navigator.clipboard.writeText(this.address);
             this.showToast('已复制到剪贴板');
+        },
+
+        copyKey() {
+            if (!this.accessKey) return;
+            navigator.clipboard.writeText(this.accessKey);
+            this.showToast('密钥已复制');
+        },
+
+        async importInbox() {
+            if (!this.importAddress || !this.importKey) {
+                this.showToast('请输入邮箱地址和密钥', 'error');
+                return;
+            }
+            try {
+                const res = await fetch('/api/inbox/' + encodeURIComponent(this.importAddress) + '?key=' + encodeURIComponent(this.importKey));
+                if (!res.ok) {
+                    this.showToast('导入失败：密钥无效或邮箱不存在', 'error');
+                    return;
+                }
+                const data = await res.json();
+                this.address = this.importAddress;
+                this.accessKey = this.importKey;
+                this.expiresAt = data.expires_at;
+                this.emails = data.emails || [];
+                this.forwardTo = data.forward_to || '';
+                this.saveCurrentInbox();
+                this.startTimer();
+                this.showImportModal = false;
+                this.importAddress = '';
+                this.importKey = '';
+                this.showToast('邮箱导入成功');
+            } catch(e) {
+                this.showToast('导入失败', 'error');
+            }
         },
 
         startTimer() {
