@@ -54,11 +54,10 @@ export class EmailHandler {
     const rawText = new TextDecoder().decode(rawArrayBuffer);
     const now = Date.now();
 
-    // 存储邮件和统计记录
-    await this.db.batch([
-      this.db.prepare('INSERT INTO emails (id, inbox_address, from_addr, subject, body, raw, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(id, to, from, subject, body, rawText, now),
-      this.db.prepare('INSERT INTO stats (from_addr, received_at) VALUES (?, ?)').bind(from, now)
-    ]);
+    // 存储邮件
+    await this.db.prepare('INSERT INTO emails (id, inbox_address, from_addr, subject, body, raw, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(id, to, from, subject, body, rawText, now).run();
+    // 存储统计记录
+    await this.db.prepare('INSERT INTO stats (from_addr, received_at) VALUES (?, ?)').bind(from, now).run();
   }
   
   escapeHtml(unsafe) {
