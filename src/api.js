@@ -21,6 +21,16 @@ export class ApiHandler {
         return this.html();
       }
 
+      // 账户 API（无需认证）
+      if (path === '/api/auth/register' && method === 'POST') {
+        const body = await request.json().catch(() => ({}));
+        return this.cors(await this.register(body.username, body.password));
+      }
+      if (path === '/api/auth/login' && method === 'POST') {
+        const body = await request.json().catch(() => ({}));
+        return this.cors(await this.login(body.username, body.password));
+      }
+
       // Token 管理 API（需要 Admin Token）
       if (path === '/api/tokens' && method === 'GET') {
         if (!this.checkAdmin(request)) return this.cors(this.json({ error: 'Unauthorized' }, 401));
@@ -38,14 +48,15 @@ export class ApiHandler {
       }
 
       // 需要 Token 认证的 API（仅当设置了 ADMIN_TOKEN 时启用）
-      if (path.startsWith('/api/') && this.adminToken) {
+      if (path.startsWith('/api/') && this.adminToken && !path.startsWith('/api/auth/')) {
         const authOk = await this.checkAuth(request);
         if (!authOk) return this.cors(this.json({ error: 'Invalid or missing API token' }, 401));
       }
 
       if (path === '/api/inbox' && method === 'POST') {
         const body = await request.json().catch(() => ({}));
-        return this.cors(await this.createInbox(body.prefix, body.domain));
+        const userId = await this.getUserId(request);
+        return this.cors(await this.createInbox(body.prefix, body.domain, userId));
       }
 
       if (path === '/api/domains' && method === 'GET') {
@@ -58,37 +69,64 @@ export class ApiHandler {
 
       if (path.startsWith('/api/inbox/') && path.endsWith('/stats') && method === 'GET') {
         const address = decodeURIComponent(path.split('/')[3]);
+        const accessKey = url.searchParams.get('key');
+        if (!await this.checkInboxAccess(address, accessKey, request)) {
+          return this.cors(this.json({ error: 'Access denied' }, 403));
+        }
         return this.cors(await this.getInboxStats(address));
       }
 
       if (path.startsWith('/api/inbox/') && path.endsWith('/renew') && method === 'POST') {
         const address = decodeURIComponent(path.split('/')[3]);
+        const body = await request.json().catch(() => ({}));
+        if (!await this.checkInboxAccess(address, body.key, request)) {
+          return this.cors(this.json({ error: 'Access denied' }, 403));
+        }
         return this.cors(await this.renewInbox(address));
       }
 
       if (path.startsWith('/api/inbox/') && path.endsWith('/forward') && method === 'POST') {
         const address = decodeURIComponent(path.split('/')[3]);
         const body = await request.json().catch(() => ({}));
+        if (!await this.checkInboxAccess(address, body.key, request)) {
+          return this.cors(this.json({ error: 'Access denied' }, 403));
+        }
         return this.cors(await this.setForward(address, body.forward_to));
       }
 
       if (path.startsWith('/api/inbox/') && method === 'GET') {
         const address = decodeURIComponent(path.split('/')[3]);
+        const accessKey = url.searchParams.get('key');
+        if (!await this.checkInboxAccess(address, accessKey, request)) {
+          return this.cors(this.json({ error: 'Access denied' }, 403));
+        }
         return this.cors(await this.getEmails(address));
       }
 
       if (path.startsWith('/api/inbox/') && method === 'DELETE') {
         const address = decodeURIComponent(path.split('/')[3]);
+        const body = await request.json().catch(() => ({}));
+        if (!await this.checkInboxAccess(address, body.key, request)) {
+          return this.cors(this.json({ error: 'Access denied' }, 403));
+        }
         return this.cors(await this.deleteInbox(address));
       }
 
       if (path.startsWith('/api/mail/') && method === 'DELETE') {
         const id = path.split('/')[3];
+        const body = await request.json().catch(() => ({}));
+        if (!await this.checkEmailAccess(id, body.key, request)) {
+          return this.cors(this.json({ error: 'Access denied' }, 403));
+        }
         return this.cors(await this.deleteEmail(id));
       }
 
       if (path.startsWith('/api/mail/') && method === 'GET') {
         const id = path.split('/')[3];
+        const accessKey = url.searchParams.get('key');
+        if (!await this.checkEmailAccess(id, accessKey, request)) {
+          return this.cors(this.json({ error: 'Access denied' }, 403));
+        }
         if (url.searchParams.get('format') === 'raw') {
             return this.cors(await this.getRawEmail(id));
         }
@@ -133,28 +171,119 @@ export class ApiHandler {
     return this.json({ success: true });
   }
 
+  async register(username, password) {
+    if (!username || !password || username.length < 3 || password.length < 6) {
+      return this.json({ error: 'Invalid username or password' }, 400);
+    }
+    const existing = await this.db.prepare('SELECT 1 FROM users WHERE username = ?').bind(username).first();
+    if (existing) {
+      return this.json({ error: 'Username already exists' }, 409);
+    }
+    const id = crypto.randomUUID();
+    const passwordHash = await this.hashPassword(password);
+    await this.db.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)').bind(id, username, passwordHash, Date.now()).run();
+    const token = await this.generateJWT(id);
+    return this.json({ token, user_id: id, username });
+  }
+
+  async login(username, password) {
+    if (!username || !password) {
+      return this.json({ error: 'Invalid credentials' }, 400);
+    }
+    const user = await this.db.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
+    if (!user || !await this.verifyPassword(password, user.password_hash)) {
+      return this.json({ error: 'Invalid credentials' }, 401);
+    }
+    const token = await this.generateJWT(user.id);
+    return this.json({ token, user_id: user.id, username: user.username });
+  }
+
+  async hashPassword(password) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(password);
+    const hash = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async verifyPassword(password, hash) {
+    return await this.hashPassword(password) === hash;
+  }
+
+  async generateJWT(userId) {
+    const header = { alg: 'HS256', typ: 'JWT' };
+    const payload = { sub: userId, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 86400 * 30 };
+    const encodedHeader = btoa(JSON.stringify(header)).replace(/=/g, '');
+    const encodedPayload = btoa(JSON.stringify(payload)).replace(/=/g, '');
+    const signature = await this.signJWT(encodedHeader + '.' + encodedPayload);
+    return encodedHeader + '.' + encodedPayload + '.' + signature;
+  }
+
+  async signJWT(data) {
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', encoder.encode('jwt-secret-key'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
+    return btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  }
+
+  async verifyJWT(token) {
+    try {
+      const parts = token.split('.');
+      if (parts.length !== 3) return null;
+      const signature = await this.signJWT(parts[0] + '.' + parts[1]);
+      if (signature !== parts[2]) return null;
+      const payload = JSON.parse(atob(parts[1]));
+      if (payload.exp < Math.floor(Date.now() / 1000)) return null;
+      return payload.sub;
+    } catch {
+      return null;
+    }
+  }
+
+  async getUserId(request) {
+    const auth = request.headers.get('Authorization');
+    if (!auth?.startsWith('Bearer ')) return null;
+    const token = auth.slice(7);
+    return await this.verifyJWT(token);
+  }
+
+  async checkInboxAccess(address, accessKey, request) {
+    const inbox = await this.db.prepare('SELECT access_key, user_id FROM inboxes WHERE address = ?').bind(address).first();
+    if (!inbox) return false;
+    if (accessKey && inbox.access_key === accessKey) return true;
+    const userId = await this.getUserId(request);
+    if (userId && inbox.user_id === userId) return true;
+    return false;
+  }
+
+  async checkEmailAccess(emailId, accessKey, request) {
+    const email = await this.db.prepare('SELECT inbox_address FROM emails WHERE id = ?').bind(emailId).first();
+    if (!email) return false;
+    return await this.checkInboxAccess(email.inbox_address, accessKey, request);
+  }
+
   async scheduled(event) {
     await this.cleanup();
   }
 
-  async createInbox(prefix, domain) {
+  async createInbox(prefix, domain, userId) {
     const selectedDomain = this.domains.includes(domain) ? domain : this.domains[0];
     let name = prefix ? prefix.toLowerCase().replace(/[^a-z0-9]/g, '') : '';
     if (!name || name.length < 3) name = this.randomName();
-    
+
     let address = `${name}@${selectedDomain}`;
     let exists = await this.db.prepare('SELECT 1 FROM inboxes WHERE address = ?').bind(address).first();
-    
+
     if (exists) {
         name = `${name}${this.randomName().slice(0, 3)}`;
         address = `${name}@${selectedDomain}`;
     }
 
     const now = Date.now();
-    await this.db.prepare('INSERT INTO inboxes (address, created_at, expires_at) VALUES (?, ?, ?)')
-        .bind(address, now, now + this.ttl).run();
-    
-    return this.json({ address, expires_at: now + this.ttl });
+    const accessKey = 'key_' + crypto.randomUUID().replace(/-/g, '');
+    await this.db.prepare('INSERT INTO inboxes (address, created_at, expires_at, access_key, user_id) VALUES (?, ?, ?, ?, ?)')
+        .bind(address, now, now + this.ttl, accessKey, userId || null).run();
+
+    return this.json({ address, expires_at: now + this.ttl, access_key: accessKey });
   }
 
   async getEmails(address) {
@@ -840,6 +969,7 @@ export class ApiHandler {
         inboxes: JSON.parse(localStorage.getItem('tm_inboxes') || '[]'),
         address: localStorage.getItem('tm_addr') || '',
         expiresAt: parseInt(localStorage.getItem('tm_exp')) || 0,
+        accessKey: localStorage.getItem('tm_key') || '',
         forwardTo: '',
         showForwardModal: false,
         forwardInput: '',
@@ -949,14 +1079,15 @@ export class ApiHandler {
                 const data = await res.json();
                 this.address = data.address;
                 this.expiresAt = data.expires_at;
+                this.accessKey = data.access_key;
                 this.emails = [];
                 this.selectedEmail = null;
-                
+
                 this.saveCurrentInbox();
                 this.startTimer();
                 this.showToast('邮箱创建成功');
-            } catch(e) { 
-                this.showToast('创建邮箱失败', 'error'); 
+            } catch(e) {
+                this.showToast('创建邮箱失败', 'error');
             }
             this.loading = false;
         },
@@ -964,10 +1095,10 @@ export class ApiHandler {
         async refreshMails(silent = false) {
             if (!this.address) return;
             if (!silent) this.loading = true;
-            
+
             try {
-                const res = await fetch('/api/inbox/' + encodeURIComponent(this.address));
-                if (res.status === 404) {
+                const res = await fetch('/api/inbox/' + encodeURIComponent(this.address) + '?key=' + encodeURIComponent(this.accessKey));
+                if (res.status === 404 || res.status === 403) {
                     this.logout();
                     return;
                 }
@@ -976,14 +1107,14 @@ export class ApiHandler {
                 this.forwardTo = data.forward_to || '';
                 localStorage.setItem('tm_exp', this.expiresAt);
                 this.saveCurrentInbox();
-                
+
                 if (data.emails.length > this.emails.length && this.emails.length > 0) {
                    this.showToast('收到新邮件！');
                    this.sendNotification('Mailfly - 新邮件', data.emails[0].subject || '(无主题)');
                 }
                 this.emails = data.emails;
             } catch(e) {}
-            
+
             if (!silent) this.loading = false;
         },
 
@@ -993,7 +1124,7 @@ export class ApiHandler {
             this.loadingBody = true;
 
             try {
-                const res = await fetch('/api/mail/' + email.id);
+                const res = await fetch('/api/mail/' + email.id + '?key=' + encodeURIComponent(this.accessKey));
                 const data = await res.json();
                 this.emailCode = data.code || null;
                 this.renderEmailBody(data.body);
@@ -1050,7 +1181,11 @@ export class ApiHandler {
         async renewInbox() {
             if (!this.address) return;
             try {
-                const res = await fetch('/api/inbox/' + encodeURIComponent(this.address) + '/renew', { method: 'POST' });
+                const res = await fetch('/api/inbox/' + encodeURIComponent(this.address) + '/renew', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ key: this.accessKey })
+                });
                 const data = await res.json();
                 this.expiresAt = data.expires_at;
                 this.saveCurrentInbox();
@@ -1062,7 +1197,11 @@ export class ApiHandler {
         },
 
         async deleteEmail(id) {
-            await fetch('/api/mail/' + id, { method: 'DELETE' });
+            await fetch('/api/mail/' + id, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ key: this.accessKey })
+            });
             this.emails = this.emails.filter(e => e.id !== id);
             if (this.selectedEmail?.id === id) this.selectedEmail = null;
             this.showToast('邮件已删除');
@@ -1074,7 +1213,7 @@ export class ApiHandler {
                 const res = await fetch('/api/inbox/' + encodeURIComponent(this.address) + '/forward', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ forward_to: this.forwardInput || null })
+                    body: JSON.stringify({ forward_to: this.forwardInput || null, key: this.accessKey })
                 });
                 const data = await res.json();
                 this.forwardTo = data.forward_to || '';
@@ -1148,7 +1287,11 @@ export class ApiHandler {
 
         async deleteInbox() {
             if (!this.address) return;
-            await fetch('/api/inbox/' + encodeURIComponent(this.address), { method: 'DELETE' });
+            await fetch('/api/inbox/' + encodeURIComponent(this.address), {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ key: this.accessKey })
+            });
             this.removeInboxFromList(this.address);
             this.logout();
             this.showToast('邮箱已删除');
@@ -1157,11 +1300,13 @@ export class ApiHandler {
         logout() {
             this.address = '';
             this.expiresAt = 0;
+            this.accessKey = '';
             this.emails = [];
             this.selectedEmail = null;
             this.timeLeft = 0;
             localStorage.removeItem('tm_addr');
             localStorage.removeItem('tm_exp');
+            localStorage.removeItem('tm_key');
             if (this.timer) clearInterval(this.timer);
         },
 
@@ -1169,12 +1314,14 @@ export class ApiHandler {
             const existing = this.inboxes.find(i => i.address === this.address);
             if (existing) {
                 existing.expiresAt = this.expiresAt;
+                existing.accessKey = this.accessKey;
             } else {
-                this.inboxes.push({ address: this.address, expiresAt: this.expiresAt });
+                this.inboxes.push({ address: this.address, expiresAt: this.expiresAt, accessKey: this.accessKey });
             }
             localStorage.setItem('tm_inboxes', JSON.stringify(this.inboxes));
             localStorage.setItem('tm_addr', this.address);
             localStorage.setItem('tm_exp', this.expiresAt);
+            localStorage.setItem('tm_key', this.accessKey);
         },
 
         removeInboxFromList(addr) {
@@ -1191,10 +1338,12 @@ export class ApiHandler {
         switchInbox(inbox) {
             this.address = inbox.address;
             this.expiresAt = inbox.expiresAt;
+            this.accessKey = inbox.accessKey;
             this.emails = [];
             this.selectedEmail = null;
             localStorage.setItem('tm_addr', this.address);
             localStorage.setItem('tm_exp', this.expiresAt);
+            localStorage.setItem('tm_key', this.accessKey);
             this.startTimer();
             this.refreshMails();
             this.showInboxList = false;
