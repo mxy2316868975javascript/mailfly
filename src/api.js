@@ -1022,7 +1022,7 @@ export class ApiHandler {
               <div class="flex items-center justify-between bg-gray-50 dark:bg-gray-700/50 rounded-lg px-3 py-2">
                 <div class="flex items-center gap-2">
                   <span class="text-xs font-bold text-gray-400" x-text="idx + 1"></span>
-                  <span class="text-sm font-mono truncate max-w-[200px]" x-text="sender.from_addr"></span>
+                  <span class="text-sm font-mono truncate max-w-[200px]" x-text="maskEmail(sender.from_addr)"></span>
                 </div>
                 <span class="text-xs font-medium text-brand-600" x-text="sender.count + ' 封'"></span>
               </div>
@@ -1088,6 +1088,15 @@ export class ApiHandler {
             const m = Math.floor(this.timeLeft / 60);
             const s = this.timeLeft % 60;
             return m + '分 ' + s + '秒 剩余';
+        },
+
+        maskEmail(email) {
+            if (!email) return '';
+            const [local, domain] = email.split('@');
+            if (!domain) return email;
+            const maskedLocal = local.length > 2 ? local.slice(0, 2) + '***' : '***';
+            const ext = domain.split('.').pop();
+            return maskedLocal + '@***.' + ext;
         },
 
         initApp() {
