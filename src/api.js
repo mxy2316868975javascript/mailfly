@@ -37,8 +37,8 @@ export class ApiHandler {
         return this.cors(await this.deleteToken(token));
       }
 
-      // 需要 Token 认证的 API
-      if (path.startsWith('/api/')) {
+      // 需要 Token 认证的 API（仅当设置了 ADMIN_TOKEN 时启用）
+      if (path.startsWith('/api/') && this.adminToken) {
         const authOk = await this.checkAuth(request);
         if (!authOk) return this.cors(this.json({ error: 'Invalid or missing API token' }, 401));
       }
@@ -1202,6 +1202,7 @@ export class ApiHandler {
         },
 
         getInboxTimeLeft(inbox) {
+            if (!inbox?.expiresAt) return '已过期';
             const left = Math.max(0, Math.floor((inbox.expiresAt - Date.now()) / 1000));
             if (left <= 0) return '已过期';
             const m = Math.floor(left / 60);
