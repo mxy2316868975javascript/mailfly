@@ -138,9 +138,28 @@ wrangler deploy
 
 | 方法 | 端点 | 描述 |
 |------|------|------|
-| `GET` | `/api/mail/:id` | 获取邮件内容 |
+| `GET` | `/api/mail/:id` | 获取邮件内容（含自动提取的验证码） |
 | `GET` | `/api/mail/:id?format=raw` | 下载原始 .eml 文件 |
 | `DELETE` | `/api/mail/:id` | 删除邮件 |
+
+### 验证码提取
+
+`GET /api/mail/:id` 返回的 JSON 中包含 `code` 字段，自动从邮件主题和正文中提取验证码：
+
+```json
+{
+  "id": "xxx",
+  "from_addr": "noreply@example.com",
+  "subject": "您的验证码是 123456",
+  "body": "...",
+  "code": "123456"
+}
+```
+
+支持的验证码格式：
+- 4-8 位纯数字（如 `123456`）
+- 4-8 位字母数字混合（如 `A1B2C3`）
+- 关键词匹配：`验证码`、`code`、`码`
 
 ### 示例
 
